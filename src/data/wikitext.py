@@ -8,8 +8,11 @@ from datasets import load_dataset, load_from_disk
 
 from src.utils import instantiate_from_config
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+PROCESSED_DATA_DIR = os.path.join(REPO_ROOT, "processed_wikitext_103")
+
 class WikiTextDataset(Dataset):
-    def __init__(self, max_seq_len, tokenizer_name="gpt2", base_path_data="/home/anji/projects/lvd2/pcvae/processed_wikitext_103", train=True, transform_fns=None):
+    def __init__(self, max_seq_len, tokenizer_name="gpt2", base_path_data=PROCESSED_DATA_DIR, train=True, transform_fns=None):
         self.train = train
         self.max_seq_len = max_seq_len
         self.tokenizer_name = tokenizer_name

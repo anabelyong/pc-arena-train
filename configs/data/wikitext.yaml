@@ -9,13 +9,13 @@ params:
     params:
       max_seq_len: 128
       tokenizer_name: gpt2
-      base_path_data: /home/anji/projects/lvd2/pcvae/processed_wikitext_103
+      base_path_data: /scratch2/anabelyong18/pc-arena/processed_wikitext_103
       train: true
   validation:
     target: src.data.wikitext.WikiTextDataset
     params:
       max_seq_len: 128
       tokenizer_name: gpt2
-      base_path_data: /home/anji/projects/lvd2/pcvae/processed_wikitext_103
+      base_path_data: /scratch2/anabelyong18/pc-arena/processed_wikitext_103
       train: false
   transform_fns:

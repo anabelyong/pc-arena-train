@@ -170,8 +170,8 @@ def main(rank, world_size, args):
     dist.barrier()
 
     pc = juice.compile(root_ns)
-    if rank == 0:
-        pc.print_statistics()
+    #if rank == 0:
+        #pc.print_statistics()
     pc.to(device)
 
     # Data loader
