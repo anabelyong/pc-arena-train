@@ -11,6 +11,7 @@ from src.utils import instantiate_from_config
 
 
 class MNIST(Dataset):
+    #reminder to change root to train with MNIST
     def __init__(self, root = "/scratch/anji/data/MNIST", train = True, transform_fns = None):
         self.train = train
         if self.train:

@@ -209,3 +209,9 @@ __marimo__/
 # Logs
 logs/
 wandb/
+processed_wikitext_103/
+__pycache__/
+*.pt
+*.ckpt
+*.bin
+*.arrow
