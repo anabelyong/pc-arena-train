@@ -1,4 +1,5 @@
 import math
+import json
 import torch
 import torch.multiprocessing as mp
 import argparse
@@ -22,11 +23,15 @@ from src.sgd import SGDWrapper
 
 from src.layers.monarchlayer import create_monarch_layers, create_dense_layer
 from src.structures.HCLTMonarch import HCLTGeneral
+
 sys.setrecursionlimit(15000)
 
 import wandb
 
 
+# -------------------------
+# DDP setup helpers
+# -------------------------
 def ddp_setup(rank: int, world_size: int, port: int):
     if 'MASTER_ADDR' not in os.environ:
         os.environ['MASTER_ADDR'] = 'localhost'
@@ -49,9 +54,12 @@ def mkdir_p(path):
 
 def copy_configs(path, args):
     mkdir_p(path)
-    shutil.copy(os.path.join("../configs/data/", args.data_config + ".yaml"), os.path.join(path, "data_config.yaml"))
-    shutil.copy(os.path.join("../configs/model/", args.model_config + ".yaml"), os.path.join(path, "model_config.yaml"))
-    shutil.copy(os.path.join("../configs/optim/", args.optim_config + ".yaml"), os.path.join(path, "optim_config.yaml"))
+    shutil.copy(os.path.join("../configs/data/", args.data_config + ".yaml"),
+                os.path.join(path, "data_config.yaml"))
+    shutil.copy(os.path.join("../configs/model/", args.model_config + ".yaml"),
+                os.path.join(path, "model_config.yaml"))
+    shutil.copy(os.path.join("../configs/optim/", args.optim_config + ".yaml"),
+                os.path.join(path, "optim_config.yaml"))
 
 
 def find_largest_epoch(file_path):
@@ -68,7 +76,10 @@ def find_largest_epoch(file_path):
 def resolve_tuple(*args):
     return tuple(args)
 
+
+# -------------------------
 # Selectivity diagnostics
+# -------------------------
 def collect_sum_node_groups(pc):
     """Collect unique sum-node groups from pc.root_ns."""
     sum_nodes = []
@@ -86,19 +97,22 @@ def collect_sum_node_groups(pc):
 def compute_selectivity_metrics(pc, sum_nodes, max_groups=64, use_flows=True):
     """
     Computes selectivity metrics over a subset of sum-node groups.
-    Uses either node flows or node mars.
+    Uses either node flows (recommended) or node mars.
+    Assumes acts has shape [K, B] so softmax(dim=0) is over 'choices'.
+    If your shapes are [B, K], change softmax dim to 1.
     """
     if len(sum_nodes) == 0:
         return {
             "act/entropy_mean": float("nan"),
+            "act/entropy_median": float("nan"),
             "act/top1_mean": float("nan"),
+            "act/top1_median": float("nan"),
             "act/effN_mean": float("nan"),
             "act/frac_top1_gt_0.9": float("nan"),
             "act/num_sum_groups_measured": 0.0,
             "act/use_flows": 1.0 if use_flows else 0.0,
         }
 
-    # Deterministic subset: take first max_groups (less noise than random sampling)
     sum_nodes = sum_nodes[:min(len(sum_nodes), max_groups)]
 
     entropies = []
@@ -119,7 +133,7 @@ def compute_selectivity_metrics(pc, sum_nodes, max_groups=64, use_flows=True):
         top1s.append(top1)
         eff_ns.append(eff_n)
 
-    entropies = torch.cat(entropies)  # concatenate over groups and batch
+    entropies = torch.cat(entropies)
     top1s = torch.cat(top1s)
     eff_ns = torch.cat(eff_ns)
 
@@ -137,6 +151,9 @@ def compute_selectivity_metrics(pc, sum_nodes, max_groups=64, use_flows=True):
     }
 
 
+# -------------------------
+# CLI
+# -------------------------
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Train PC with DDP")
 
@@ -145,29 +162,30 @@ def parse_arguments():
     parser.add_argument("--optim-config", type=str, default="full_em")
 
     parser.add_argument("--gpu-batch-size", type=int, default=256)
-
-    parser.add_argument("--layer-type", type=str, default="dense", choices=["dense", "monarch"],
-                        help="Type of layer to use for the model.")
-
+    parser.add_argument("--layer-type", type=str, default="dense",
+                        choices=["dense", "monarch"], help="Type of layer to use for the model.")
     parser.add_argument("--resume", default=False, action="store_true")
     parser.add_argument("--port", type=int, default=0)
 
-    # Weights & Biases (wandb) minimal options
+    # W&B
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging (rank 0 only)")
     parser.add_argument("--wandb-project", type=str, default="pc-arena", help="Wandb project name")
     parser.add_argument("--wandb-name", type=str, default=None, help="Wandb run name")
 
-    # === Selectivity diagnostics options ===
+    # Selectivity tracking
     parser.add_argument("--act-log-every", type=int, default=10,
                         help="Log selectivity metrics every N global updates (rank 0 only).")
-    parser.add_argument("--act-num-sum-groups", type=int, default=64,
-                        help="How many sum-node groups to measure each time (deterministic first N groups).")
+    parser.add_argument("--act-num-sum-groups", type=int, default=128,
+                        help="How many sum-node groups to measure each time.")
     parser.add_argument("--act-probe-batch-size", type=int, default=64,
                         help="Probe batch size used for selectivity tracking (rank 0 only).")
 
     return parser.parse_args()
 
 
+# -------------------------
+# Main
+# -------------------------
 def main(rank, world_size, args):
     torch.set_num_threads(8)
     OmegaConf.register_new_resolver('as_tuple', resolve_tuple)
@@ -177,14 +195,23 @@ def main(rank, world_size, args):
 
     epoch_start = 1
 
-    # Logging
-    base_folder = os.path.join("logs/", f"{args.data_config}/[{args.model_config}]-[{args.optim_config}]-[pseudocount-1e-6]/")
+    # Logging folders/files
+    base_folder = os.path.join(
+        "logs/",
+        f"{args.data_config}/[{args.model_config}]-[{args.optim_config}]-[pseudocount-1e-6]/"
+    )
     mkdir_p(base_folder)
     config_folder = os.path.join(base_folder, "configs/")
     copy_configs(config_folder, args)
+
     logfile = os.path.join(base_folder, "logs.txt")
     pcfile_last = os.path.join(base_folder, "last.jpc")
     pcfile_best = os.path.join(base_folder, "best.jpc")
+
+    # NEW: local selectivity log
+    selectivity_logfile = os.path.join(base_folder, "selectivity.jsonl")
+    if rank == 0:
+        print(f"[rank 0] Selectivity metrics will be appended to: {selectivity_logfile}")
 
     # Dataset
     data_config = OmegaConf.load(os.path.join("../configs/data/", args.data_config + ".yaml"))
@@ -215,7 +242,6 @@ def main(rank, world_size, args):
                 layer_fn = create_monarch_layers
                 if 'num_latents' in model_config['params']:
                     model_config['params']['block_size'] = int(model_config['params']['num_latents'] ** 0.5)
-
                 model_config['params']['homogeneous_inputs'] = True
                 model_kwargs['layer_fn'] = layer_fn
 
@@ -238,23 +264,19 @@ def main(rank, world_size, args):
     pc = juice.compile(root_ns)
     pc.to(device)
 
-    # Collect sum-node groups for selectivity diagnostics
+    # Collect sum-node groups once
     sum_nodes = collect_sum_node_groups(pc)
     if rank == 0:
         print(f"[rank 0] Collected {len(sum_nodes)} sum-node groups for selectivity diagnostics.")
 
-    # Data loader
+    # Dataloaders
     SUBSET_SIZE = 1000000
-    train_sampler = DistributedSubsetSampler(
-        dsets.datasets["train"],
-        subset_size=SUBSET_SIZE,
-        shuffle=True
-    )
+    train_sampler = DistributedSubsetSampler(dsets.datasets["train"], subset_size=SUBSET_SIZE, shuffle=True)
     tr_loader = dsets._train_dataloader(sampler=train_sampler)
     vl_loader = dsets._val_dataloader()
     print(f"[rank {rank}] Dataloaders constructed")
 
-    # Build a fixed probe batch (rank 0 only)
+    # Fixed probe batch (rank 0 only)
     probe_batch = None
     if rank == 0:
         for xb in tr_loader:
@@ -262,7 +284,7 @@ def main(rank, world_size, args):
             probe_batch = xb[:bs].clone()
             break
 
-    # Optimizer
+    # Optim config
     optim_config = OmegaConf.load(os.path.join("../configs/optim/", args.optim_config + ".yaml"))
     optim_mode = optim_config["mode"]
     num_epochs = optim_config["num_epochs"]
@@ -274,32 +296,38 @@ def main(rank, world_size, args):
     elif optim_mode == "mini_em" or optim_mode == "mini_em_scaled":
         step_size = optim_config["step_size"]
         niters_per_update = optim_config["batch_size"] // world_size // args.gpu_batch_size
-        assert niters_per_update > 0
+        assert niters_per_update > 0, (
+            f"Please make sure gpu_batch_size({args.gpu_batch_size})*world_size({world_size}) "
+            f"<= batch_size({optim_config['batch_size']})"
+        )
         momentum = float(optim_config.get("momentum", 0.0))
     elif optim_mode == "adam":
         momentum = 0.0
         step_size = optim_config["lr"]
         niters_per_update = optim_config["batch_size"] // world_size // args.gpu_batch_size
         cum_batch_size = optim_config["batch_size"]
-        assert niters_per_update > 0
-
+        assert niters_per_update > 0, (
+            f"Please make sure gpu_batch_size({args.gpu_batch_size})*world_size({world_size}) "
+            f"<= batch_size({optim_config['batch_size']})"
+        )
         pcopt = SGDWrapper(pc)
-        adam_kwargs = dict()
+        adam_kwargs = {}
         if "beta1" in optim_config:
             adam_kwargs["beta1"] = optim_config["beta1"]
         if "beta2" in optim_config:
             adam_kwargs["beta2"] = optim_config["beta2"]
     else:
         raise NotImplementedError()
-    print(f"[rank {rank}] Optimizer set")
 
-    # Scheduler (optional)
+    print(f"[rank {rank}] Optimizer set (mode={optim_mode}, niters_per_update={niters_per_update})")
+
+    # Scheduler optional
     if "scheduler" in optim_config:
         lr_scheduler = instantiate_from_config(optim_config["scheduler"])
     else:
         lr_scheduler = None
 
-    # Initialize wandb (rank 0 only)
+    # Wandb init (rank 0 only)
     use_wandb = (rank == 0) and bool(getattr(args, "wandb", False))
     if use_wandb:
         run_name = args.wandb_name or f"{args.data_config}-{args.model_config}-{args.optim_config}-{time.strftime('%Y%m%d_%H%M%S')}"
@@ -329,29 +357,30 @@ def main(rank, world_size, args):
         assert x.dim() == 2 and x.size(1) == pc.num_vars
         break
 
-    # CUDA Graph warmup
+    # CUDA graph warmup (optional)
     for batch in tr_loader:
         x = batch.to(device)
         with torch.cuda.device(f'cuda:{rank}'):
-            lls = pc(x, propagation_alg="LL", record_cudagraph=True)
+            _ = pc(x, propagation_alg="LL", record_cudagraph=True)
             pc.backward(x, flows_memory=1.0, allow_modify_flows=False,
                         propagation_alg="LL", logspace_flows=True)
         break
 
-    # Main training loop
+    # Progress bar on rank 0
     if rank == 0:
         progress_bar = ProgressBar(num_epochs, len(tr_loader), ["LL"], cumulate_statistics=True)
         progress_bar.set_epoch_id(epoch_start - 1)
         best_val_ll = -torch.inf
 
+    # Flow init
     pc.init_param_flows(flows_memory=0.0)
 
-    # Momentum
+    # Momentum buffers
     if momentum > 0.0:
-        momentum_flows = dict()
-        momentum_flows["sum_flows"] = torch.zeros(pc.param_flows.size(), dtype=torch.float32, device=device)
+        momentum_flows = {}
+        momentum_flows["sum_flows"] = torch.zeros_like(pc.param_flows, dtype=torch.float32, device=device)
         for i, layer in enumerate(pc.input_layer_group):
-            momentum_flows[f"input_flows_{i}"] = torch.zeros(layer.param_flows.size(), dtype=torch.float32, device=device)
+            momentum_flows[f"input_flows_{i}"] = torch.zeros_like(layer.param_flows, dtype=torch.float32, device=device)
 
     step_count = 0
     global_step_count = 0
@@ -359,7 +388,16 @@ def main(rank, world_size, args):
 
     for epoch in range(epoch_start, num_epochs + 1):
         train_sampler.set_epoch(epoch)
+
+        # NEW: print steps per epoch + effective update batch size
         if rank == 0:
+            steps_per_epoch = len(tr_loader)
+            eff_update_batch = niters_per_update * world_size * args.gpu_batch_size
+            print(
+                f"[rank 0] Epoch {epoch}/{num_epochs} | steps_per_epoch={steps_per_epoch} "
+                f"| gpu_batch={args.gpu_batch_size} | world_size={world_size} "
+                f"| niters_per_update={niters_per_update} | effective_update_batch={eff_update_batch}"
+            )
             progress_bar.new_epoch_begin()
 
         for x in tr_loader:
@@ -374,14 +412,15 @@ def main(rank, world_size, args):
                     pcopt.partition_eval(negate_pflows=True)
                     lls = lls - pc.node_mars[-1, 0]
 
-            curr_ll = lls.mean().detach().cpu().numpy().item()
+            curr_ll_local = lls.mean().detach()
 
-            stats = torch.tensor([curr_ll]).to(device)
+            # average LL across ranks
+            stats = torch.tensor([curr_ll_local.item()], device=device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            if rank == 0:
-                curr_ll = stats[0].item() / world_size
-                progress_bar.new_batch_done([curr_ll])
+            curr_ll = (stats[0].item() / world_size)
 
+            if rank == 0:
+                progress_bar.new_batch_done([curr_ll])
                 if use_wandb:
                     wandb.log({
                         "train/ll": curr_ll,
@@ -393,6 +432,8 @@ def main(rank, world_size, args):
                     wandb_step += 1
 
             step_count += 1
+
+            # Update boundary
             if step_count >= niters_per_update:
                 step_count = 0
 
@@ -405,21 +446,21 @@ def main(rank, world_size, args):
                     dist.all_reduce(layer.param_flows, op=dist.ReduceOp.SUM)
                 dist.barrier()
 
-                # Update parameters
+                # Apply parameter update
                 if optim_mode != "adam":
                     if optim_mode == "mini_em_scaled":
                         pc._cum_flow *= world_size
+
                         if momentum > 0.0:
                             with torch.no_grad():
                                 pc.param_flows.mul_(1.0 - momentum)
-                                momentum_flows["sum_flows"].mul_(momentum)
-                                momentum_flows["sum_flows"].add_(pc.param_flows)
+                                momentum_flows["sum_flows"].mul_(momentum).add_(pc.param_flows)
                                 pc.param_flows[:] = momentum_flows["sum_flows"]
                                 pc.param_flows.div_(1.0 - math.pow(momentum, global_step_count + 1))
+
                                 for i, layer in enumerate(pc.input_layer_group):
                                     layer.param_flows.mul_(1.0 - momentum)
-                                    momentum_flows[f"input_flows_{i}"].mul_(momentum)
-                                    momentum_flows[f"input_flows_{i}"].add_(layer.param_flows)
+                                    momentum_flows[f"input_flows_{i}"].mul_(momentum).add_(layer.param_flows)
                                     layer.param_flows[:] = momentum_flows[f"input_flows_{i}"]
                                     layer.param_flows.div_(1.0 - math.pow(momentum, global_step_count + 1))
 
@@ -430,14 +471,14 @@ def main(rank, world_size, args):
                     pcopt.apply_update(cum_batch_size, step_size, **adam_kwargs)
                     pcopt.normalize_by_flows()
 
-                # Reset flows after update (important)
+                # Reset flows after update
                 pc.init_param_flows(flows_memory=0.0)
-
                 global_step_count += 1
 
-                # Selectivity diagnostics AFTER update (rank 0 only) 
-                if rank == 0 and use_wandb and (global_step_count % args.act_log_every == 0) and (probe_batch is not None):
+                # NEW: Always compute + print + save selectivity metrics (rank 0)
+                if rank == 0 and (global_step_count % args.act_log_every == 0) and (probe_batch is not None):
                     pb = probe_batch.to(device)
+
                     with torch.cuda.device(f'cuda:{rank}'):
                         _ = pc(pb, propagation_alg="LL")
                         pc.backward(pb, flows_memory=1.0, allow_modify_flows=False,
@@ -449,36 +490,51 @@ def main(rank, world_size, args):
                     mars_metrics = compute_selectivity_metrics(
                         pc, sum_nodes, max_groups=args.act_num_sum_groups, use_flows=False
                     )
-
-                    # Namespace the mars metrics so they're distinct
                     mars_metrics = {k.replace("act/", "act_mars/"): v for k, v in mars_metrics.items()}
-                    flow_metrics["trainer/global_update"] = global_step_count
-                    mars_metrics["trainer/global_update"] = global_step_count
 
-                    wandb.log({**flow_metrics, **mars_metrics}, step=wandb_step)
+                    # 1) Human-readable print
+                    print(
+                        f"[rank 0][act] upd={global_step_count:06d} "
+                        f"trainLL={curr_ll:.3f} "
+                        f"flow_ent={flow_metrics['act/entropy_mean']:.3f} "
+                        f"flow_top1={flow_metrics['act/top1_mean']:.3f} "
+                        f"flow_sel%={100.0*flow_metrics['act/frac_top1_gt_0.9']:.2f} "
+                        f"mars_ent={mars_metrics['act_mars/entropy_mean']:.3f} "
+                        f"mars_top1={mars_metrics['act_mars/top1_mean']:.3f}"
+                    )
 
-                    # Reset flows again so diagnostics never leak into training
+                    # 2) JSONL append
+                    record = {
+                        "time": time.time(),
+                        "epoch": epoch,
+                        "global_update": global_step_count,
+                        "train_ll": float(curr_ll),
+                        "gpu_batch_size": int(args.gpu_batch_size),
+                        "world_size": int(world_size),
+                        "niters_per_update": int(niters_per_update),
+                        **flow_metrics,
+                        **mars_metrics,
+                    }
+                    with open(selectivity_logfile, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(record) + "\n")
+
+                    # 3) Optional W&B log
+                    if use_wandb:
+                        wandb.log({**flow_metrics, **mars_metrics,
+                                   "trainer/global_update": global_step_count,
+                                   "optim/step_size": float(step_size)},
+                                  step=wandb_step)
+
+                    # Reset flows so diagnostics never leak into training
                     pc.init_param_flows(flows_memory=0.0)
 
-                if rank == 0 and use_wandb:
-                    wandb.log({
-                        "optim/step_size": float(step_size),
-                        "trainer/global_update": global_step_count,
-                    }, step=wandb_step)
-
-        # Epoch end logging
+        # Epoch end write-out
         if rank == 0:
             aveg_train_ll = progress_bar.epoch_ends()[0]
             with open(logfile, "a+") as f:
                 f.write(f"[Epoch {epoch:05d}] - Aveg train LL: {aveg_train_ll:.4f}; Step size: {step_size:.4f}\n")
-            if use_wandb:
-                wandb.log({
-                    "train/ll_epoch": aveg_train_ll,
-                    "optim/step_size": float(step_size),
-                    "trainer/epoch": epoch,
-                }, step=wandb_step)
 
-        # Validation
+        # Validation every 5 epochs
         if epoch % 5 == 0:
             local_ll_sum = 0.0
             for x in vl_loader:
@@ -490,8 +546,9 @@ def main(rank, world_size, args):
                         lls = lls - pc.node_mars[-1, 0]
                 local_ll_sum += lls.mean().item()
 
-            stats = torch.tensor([local_ll_sum]).to(device)
+            stats = torch.tensor([local_ll_sum], device=device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
             if rank == 0:
                 aveg_valid_ll = stats[0].item() / world_size / len(vl_loader)
                 print(f"[Epoch {epoch:05d}] - Aveg validation LL: {aveg_valid_ll:.4f}")
